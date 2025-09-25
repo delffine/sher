@@ -1,4 +1,4 @@
-## Аналитика данных из API Wildberries, Ozon и Google sheets в DataLens
+## Дашборды аналитики данных из API Wildberries, Ozon и Google sheets в DataLens
 
 Мой первый коммерческий проект: перевод системы анализа и учета продаж через Wildberries, Ozon, а также в розницу и оптом из таблиц Google sheets на аналитические дашборды в DataLens. У заказчика была реализована выгрузка по API из Wildberries и Ozon в Google sheets с дальнейшей обработкой и агрегацией этих и своих данных по рознице и опту в эксельках.
 
