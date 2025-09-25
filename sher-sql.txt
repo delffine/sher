@@ -1,0 +1,981 @@
+----------------------------------- Примеры SQL запросов ---------------------------------
+
+
+/*
+Отчёт по WB заказам, продажам и возвратам с возможностью группировки по артукулам, магазину, сегменту, партнеру.
+Входные параметры
+{{date_from}}, {{date_to}} — период анализа.
+{{grb}} — группировка (subject/brand/supplierarticle/partner).
+{{partner}}, {{subject}}, {{brand}} — фильтры (если _ — фильтр отключён).
+{{par_char_articul_like}} — поиск по артикулу/номенклатуре (WB).
+
+Логика работы
+3 временные таблицы:
+o — заказы (не отменённые).
+s — продажи (finishedprice > 0).
+r — возвраты (finishedprice < 0, сумма преобразуется в положительную).
+
+Группировка (зависит от {{grb}}):
+Подсчёт количества, суммы, WB-артикулов.
+Для supplierarticle выводится один nmid, для остальных — количество уникальных.
+
+Итоговый отчёт:
+Объединение данных через FULL JOIN (чтобы не потерять строки).
+Расчёт долей (% от общего количества/стоимости).
+Сортировка по убыванию стоимости заказов (ORDER BY 5 DESC).
+
+----------
+o (orders) — Агрегирует данные по заказам (количество, стоимость) с группировкой по выбранному параметру (subject, brand, nmid или partner) и артикулу.
+s (sales) — Агрегирует данные по продажам (выкупы, forpay) с аналогичной группировкой.
+r (returns) — Агрегирует данные по возвратам с той же группировкой.
+pre_final_table — Объединяет данные из заказов, продаж и возвратов в общую таблицу с основными метриками.
+final_table — Группирует данные окончательно, вычисляет доли и средние значения, объединяет артикулы для nmid.
+Итоговый SELECT — Добавляет строку с итогами по всем данным и сортирует результат по доле заказов (по убыванию).
+*/
+
+
+WITH 
+o as
+(SELECT
+    CASE WHEN {{grb}} = 'subject' THEN subject
+        WHEN {{grb}} = 'brand' THEN brand
+        WHEN {{grb}} = 'nmid' THEN nmid::text
+        ELSE partner
+        END  as o_grb
+    , CASE WHEN {{grb}} = 'nmid' THEN supplierarticle
+        ELSE 'all' --COUNT(DISTINCT nmid)::text
+        END as o_wb_articul
+    , COUNT(DISTINCT nmid) as o_nmid_count
+    , count(srid) as o_count
+    , sum(finishedprice) as o_sum   
+FROM
+    wb_orders
+WHERE
+    iscancel IN ('False')
+    AND date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+    AND CASE WHEN '_' IN {{partner}} THEN TRUE
+        ELSE partner IN {{partner}} END
+    AND CASE WHEN '_' IN {{subject}} THEN TRUE
+        ELSE subject IN {{subject}} END  
+    AND CASE WHEN '_' IN {{brand}} THEN TRUE
+        ELSE brand IN {{brand}} END  
+    AND CASE WHEN '_' IN {{regionname}} THEN TRUE
+        ELSE regionname IN {{regionname}} END             
+    AND (supplierarticle ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  nmid::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))  
+GROUP BY
+    1, 2)
+, s as
+(SELECT
+    CASE WHEN {{grb}} = 'subject' THEN subject
+        WHEN {{grb}} = 'brand' THEN brand
+        WHEN {{grb}} = 'nmid' THEN nmid::text
+        ELSE partner
+        END  as s_grb     
+    , CASE WHEN {{grb}} = 'nmid' THEN supplierarticle
+        ELSE 'all' --COUNT(DISTINCT nmid)::text
+        END as s_wb_articul
+    , COUNT(DISTINCT nmid) as s_nmid_count
+    , count(saleid) as s_count
+    , sum(finishedprice) as s_sum
+    , sum(forpay) as s_forpay     
+FROM
+    wb_sales
+WHERE
+    finishedprice > 0 
+    AND date::date BETWEEN {{date_from}}::date AND {{date_to}}::date      
+    AND CASE WHEN '_' IN {{partner}} THEN TRUE
+        ELSE partner IN {{partner}} END
+    AND CASE WHEN '_' IN {{subject}} THEN TRUE
+        ELSE subject IN {{subject}} END  
+    AND CASE WHEN '_' IN {{brand}} THEN TRUE
+        ELSE brand IN {{brand}} END  
+    AND CASE WHEN '_' IN {{regionname}} THEN TRUE
+        ELSE regionname IN {{regionname}} END             
+    AND (supplierarticle ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  nmid::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))      
+GROUP BY
+    1, 2)
+, r as
+(SELECT
+    CASE WHEN {{grb}} = 'subject' THEN subject
+        WHEN {{grb}} = 'brand' THEN brand
+        WHEN {{grb}} = 'nmid' THEN nmid::text
+        ELSE partner
+        END  as r_grb  
+    , CASE WHEN {{grb}} = 'nmid' THEN supplierarticle
+        ELSE 'all'
+        END as r_wb_articul
+    , COUNT(DISTINCT nmid) as r_nmid_count
+    , count(saleid) as r_count
+    , -1 * sum(finishedprice) as r_sum
+FROM
+    wb_sales
+WHERE
+    finishedprice < 0 
+    AND date::date BETWEEN {{date_from}}::date AND {{date_to}}::date 
+    AND CASE WHEN '_' IN {{partner}} THEN TRUE
+        ELSE partner IN {{partner}} END
+    AND CASE WHEN '_' IN {{subject}} THEN TRUE
+        ELSE subject IN {{subject}} END  
+    AND CASE WHEN '_' IN {{brand}} THEN TRUE
+        ELSE brand IN {{brand}} END
+    AND CASE WHEN '_' IN {{regionname}} THEN TRUE
+        ELSE regionname IN {{regionname}} END             
+    AND (supplierarticle ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  nmid::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))         
+GROUP BY
+    1, 2),   
+pre_final_table as (
+SELECT
+    COALESCE(o.o_grb, s.s_grb, r.r_grb) as "Группа"
+    --- Вариант объединения по сочетанию nmid и supplierarticle
+    , CASE WHEN {{grb}} = 'nmid' THEN
+        COALESCE(o.o_wb_articul, s.s_wb_articul, r.r_wb_articul)
+        ELSE s_nmid_count::text
+    END as "WB артикул"
+    --- Ваоиант объединения только по nmid
+    --, CASE WHEN {{grb}} = 'nmid' THEN
+    --    ARRAY_TO_STRING(ARRAY(SELECT DISTINCT unnest FROM unnest(o.o_wb_articul || s.s_wb_articul || r.r_wb_articul)),  chr(10))
+    --    ELSE s_nmid_count::text
+    --END as "WB артикул"
+    , COALESCE(o.o_count, 0) as "Колво заказов"
+    --, COALESCE(100 * o.o_count / NULLIF(SUM(o.o_count) OVER(), 0), 0) as "% заказов" 
+    , COALESCE(o.o_sum, 0) as "Стоимость заказов"
+    --, COALESCE(100 * o.o_sum / NULLIF(SUM(o.o_sum) OVER(), 0), 0) as "% стоимости"
+    , COALESCE(o.o_sum / NULLIF(o.o_count, 0), 0) as "Средняя цена"    
+    , COALESCE(s.s_forpay, 0) as "ForPay" 
+    , COALESCE(s.s_count, 0) as "Колво выкупов"
+    , COALESCE(s.s_sum, 0) as "Стоимость выкупов"
+    , COALESCE(r.r_count, 0) as "Колво возвратов"
+    , COALESCE(r.r_sum, 0) as "Стоимость возвратов"    
+FROM
+    o
+FULL JOIN
+    s ON o.o_grb = s.s_grb
+    AND o.o_wb_articul = s.s_wb_articul   
+FULL JOIN
+    r ON o.o_grb = r.r_grb
+    AND o.o_wb_articul = r.r_wb_articul
+), 
+final_table as (
+SELECT
+    CASE WHEN {{grb_nmid}} = True THEN "Группа" ELSE "Группа" || "WB артикул" END as "GRB"
+    , MIN("Группа") as "Группа"
+    , ARRAY_TO_STRING(array_agg(DISTINCT "WB артикул"), chr(10)) as "WB артикул"
+    , SUM("Колво заказов") as "Колво заказов"
+    , SUM("Колво заказов") / SUM(SUM("Колво заказов")) OVER () as  "% заказов" 
+    , SUM("Стоимость заказов") as "Стоимость заказов"
+    , SUM("Стоимость заказов") / SUM(SUM("Стоимость заказов")) OVER () as  "% стоимости"  
+    , SUM("Стоимость заказов") /  NULLIF(SUM("Колво заказов"), 0) as "Средняя цена"    
+    , SUM("ForPay") as "ForPay"
+    , SUM("Колво выкупов") as "Колво выкупов"
+    , SUM("Стоимость выкупов") as "Стоимость выкупов"            
+    , SUM("Колво возвратов") as "Колво возвратов"  
+    , SUM("Стоимость возвратов") as "Стоимость возвратов"          
+FROM
+    pre_final_table
+GROUP BY
+    "GRB"      
+)
+
+SELECT
+    *
+FROM
+    final_table
+UNION 
+SELECT
+    'GRB'
+    , '- Итого -'
+    , ''
+    , SUM("Колво заказов")
+    , NULL
+    , SUM("Стоимость заказов")
+    , NULL
+    , SUM("Стоимость заказов") / SUM("Колво заказов")
+    , SUM("ForPay") 
+    , SUM("Колво выкупов") 
+    , SUM("Стоимость выкупов") 
+    , SUM("Колво возвратов")    
+    , SUM("Стоимость возвратов")                  
+FROM
+    final_table
+ORDER BY
+    5 DESC    
+
+------------------------------------------------------------------
+
+/*
+Код анализирует прибыльность каждого товара на Ozon, учитывая все виды начислений, комиссий, расходов и распределяя общие затраты.
+
+prod — Выбирает уникальные SKU из транзакций Ozon за указанный период.
+t1 — Детализирует транзакции, разделяя финансовые показатели (начисления, комиссии) по количеству SKU в заказе.
+nosku — Суммирует расходы на рекламу и прочие операции, не привязанные к конкретным SKU.
+t2 — Агрегирует финансовые данные по каждому SKU (доставка, возвраты, бонусы и т.д.), включая расчет себестоимости.
+t3 — Распределяет общие расходы (реклама и прочее) пропорционально количеству единиц товара.
+t4 — Рассчитывает итоговую прибыль по каждому SKU, суммируя все доходы и расходы.
+Итоговый SELECT — Выводит детализированную финансовую отчетность по топ-30 SKU, отсортированную по прибыли (возрастание/убывание в зависимости от параметра {{sort}}).
+
+*/
+WITH 
+prod as (
+SELECT
+    DISTINCT unnest(STRING_TO_ARRAY(skus, ','))::BIGINT as sku
+FROM
+    oz_transactions as t
+WHERE    
+    operation_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE t.shop IN {{shop}} END     
+),
+
+t1 as (
+SELECT
+    sku
+    , operation_type_name
+    , operation_date
+    , accruals_for_sale
+    , sale_commission
+    , service_amount
+    , amount
+    , array_length(STRING_TO_ARRAY(skus, ','), 1) as sku_q
+    , array_length(string_to_array(skus, sku::varchar), 1) - 1 as ed_count
+FROM
+    prod as p
+JOIN
+    oz_transactions as t
+ON
+    t.skus::varchar LIKE '%'||p.sku::varchar||'%'
+    AND operation_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE t.shop IN {{shop}} END 
+),
+
+nosku as (
+SELECT
+     SUM(amount) FILTER (WHERE operation_type_name IN ('Продвижение с оплатой за заказ'
+                     , 'Вывод в топ', 'Закрепление отзыва', 'Трафареты', 'Подписка Premium')
+                     ) as adv
+    , SUM(amount) FILTER (WHERE operation_type_name NOT IN ('Доставка покупателю'
+                , 'Оплата эквайринга', 'Доставка и обработка возврата, отмены, невыкупа'
+                , 'Получение возврата, отмены, невыкупа от покупателя', 'Бонусы продавца', 'Звёздные товары'
+                , 'Продвижение с оплатой за заказ', 'Вывод в топ', 'Закрепление отзыва', 'Трафареты', 'Подписка Premium')
+                   ) as others
+    
+FROM
+    oz_transactions as t
+WHERE
+    operation_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE t.shop IN {{shop}} END    
+    AND skus = ''
+),
+
+t2 as (
+SELECT
+    t1.sku
+    , p.articul
+    , COALESCE(SUM(ed_count) FILTER (WHERE operation_type_name = 'Доставка покупателю'), 0) as ed_count    
+    , COALESCE(SUM(accruals_for_sale / sku_q) FILTER (WHERE operation_type_name = 'Доставка покупателю'), 0)::NUMERIC(10, 2) as accruals_for_sale     
+    , COALESCE(SUM(sale_commission / sku_q) FILTER (WHERE operation_type_name = 'Доставка покупателю'), 0)::NUMERIC(10, 2) as sale_commission  
+    , COALESCE(SUM(amount / sku_q) FILTER (WHERE operation_type_name = 'Оплата эквайринга'), 0)::NUMERIC(10, 2) as acquiring
+    , COALESCE(SUM(service_amount / sku_q) FILTER (WHERE operation_type_name = 'Доставка покупателю'), 0)::NUMERIC(10, 2) as delivery    
+    , COALESCE(SUM(service_amount / sku_q) FILTER (WHERE operation_type_name = 'Доставка и обработка возврата, отмены, невыкупа'), 0)::NUMERIC(10, 2) as returns_delivery    
+    , COALESCE(SUM(accruals_for_sale / sku_q) FILTER (WHERE operation_type_name = 'Получение возврата, отмены, невыкупа от покупателя'), 0)::NUMERIC(10, 2) as returns_accruals_for_sale 
+    , COALESCE(SUM(sale_commission / sku_q) FILTER (WHERE operation_type_name = 'Получение возврата, отмены, невыкупа от покупателя'), 0)::NUMERIC(10, 2) as returns_sale_commission    
+    , COALESCE(SUM(amount / sku_q) FILTER (WHERE operation_type_name = 'Бонусы продавца'), 0)::NUMERIC(10, 2) as bonus    
+    , COALESCE(SUM(amount / sku_q) FILTER (WHERE operation_type_name = 'Звёздные товары'), 0)::NUMERIC(10, 2) as starts  
+    , COALESCE(SUM(amount / sku_q) FILTER (WHERE operation_type_name NOT IN ('Доставка покупателю'
+                , 'Оплата эквайринга', 'Доставка и обработка возврата, отмены, невыкупа'
+                , 'Получение возврата, отмены, невыкупа от покупателя', 'Бонусы продавца', 'Звёздные товары'
+                , 'Продвижение с оплатой за заказ', 'Вывод в топ', 'Закрепление отзыва', 'Трафареты', 'Подписка Premium')
+                   ), 0)::NUMERIC(10, 2) as others_sku
+    , COALESCE(-1 * SUM(cp.costprice * ed_count) FILTER (WHERE operation_type_name = 'Доставка покупателю'), 0) as costprise
+FROM
+    t1
+LEFT JOIN 
+    oz_products as p
+ON
+    t1.sku = p.sku     
+LEFT JOIN
+    gs_cost_price_oz as cp
+ON
+    t1.sku = cp.sku            
+GROUP BY
+    1, 2
+),
+t3 as (
+SELECT
+    *  
+    , (ed_count * (SELECT adv FROM nosku)::NUMERIC(10, 2) / (SUM(ed_count) OVER ()))::NUMERIC(10, 2) as adv 
+    , (ed_count * (SELECT others FROM nosku)::NUMERIC(10, 2) / (SUM(ed_count) OVER ()))::NUMERIC(10, 2) as others
+FROM
+    t2
+),
+
+t4 as (
+SELECT
+    * 
+    , accruals_for_sale + sale_commission + acquiring + delivery 
+            + returns_delivery + returns_accruals_for_sale + others_sku 
+            + returns_sale_commission + bonus + starts
+            + adv + others + costprise as mp_profit         
+FROM
+    t3   
+)
+
+SELECT
+    t4.sku as sku
+    , articul as articul
+    , ed_count as "Колво штук"       
+    , accruals_for_sale as "Стоимость продавца"
+    , sale_commission as "Комиссия"
+    , acquiring as "Эквайринг"
+    , delivery as "Доставка"
+    , returns_delivery as "Доставка возвратов"
+    , returns_accruals_for_sale as "Возврат стоимости продавца"
+    , returns_sale_commission as "Возврат комиссии"
+    , bonus as "Бонус"
+    , starts as "Звезды"
+    , others_sku as "Другое с sku"      
+    , costprise as "Себестоимость"    
+    , adv as "Реклама"
+    , others as "Остальное"  
+    , mp_profit as "Доход"   
+FROM
+    t4
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    t4.sku = c.sku
+WHERE
+    (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  t4.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%')) 
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END         
+ORDER BY
+    --mp_profit DESC
+    CASE WHEN {{sort}} = 'asc' THEN mp_profit
+    ELSE -1 * mp_profit
+    END    
+LIMIT
+    30
+	
+
+
+
+
+
+-----------------------------------------------------------------
+
+/*
+Запрос анализарует разницу ABC и XYZ анализа двух произвольных периодов для WB
+Входные параметры:
+- {{date1_from}} и {{date1_to}}  / {{date2_from}} и {{date2_to}} — фильт периодов
+- {{shop}}, {{fbos}}, {{par_char_articul_like}} — фильтры по магазину, модели FBO/FBS, артикулу.
+- {{abc1}}, {{abc2}} / {{xyz1}}, {{xyz2}} - фильтры для рангов в выводимой таблице
+
+логика:
+Для первого заданного периода вычисляется агрегация по артикулам количество заказов и стоимость
+Для ABC анализа первому периоду вычисляется процент продаж каждого артикула, затем вычисляется сумма процентов нарастанием.
+Для XYZ анализа стояться такие же таблица -1 и -2 период назад, затем вычисляется срднее колво продаж за три периоду и ст.отклонение
+Аналогичные вычисления строятся для второго заданного периода 
+Полученные таблицы по двум заданным периодам сводятся в одну по nmid
+
+--------------
+period_1 — Агрегирует данные по доставленным заказам Ozon за первый период: количество продаж, стоимость и долю в общей выручке для каждого SKU.
+period_1_m1 — Аналогично агрегирует данные за период, предшествующий первому (сдвиг на длительность первого периода).
+period_1_m2 — Аналогично агрегирует данные за период, предшествующий period_1_m1 (сдвиг на две длительности первого периода).
+xyz_pre1 — Объединяет данные за три периода (текущий и два предыдущих) для расчета среднего количества продаж.
+xyz1 — Рассчитывает стандартное отклонение продаж для определения стабильности спроса (XYZ-анализ) за первый период.
+abc_per1 — Проводит ABC-анализ по доле в выручке и вычисляет кумулятивную долю для товаров за первый период.
+
+period_2 — Аналогично агрегирует данные за второй период.
+period_2_m1 — Аналогично агрегирует данные за период, предшествующий второму.
+period_2_m2 — Аналогично агрегирует данные за период, предшествующий period_2_m1.
+xyz_pre2 — Объединяет данные за три периода для второго периода.
+xyz2 — Рассчитывает стандартное отклонение продаж для второго периода.
+abc_per2 — Проводит ABC-анализ для второго периода.
+
+pre_table — Объединяет данные обоих периодов, добавляет сравнение показателей и классификации ABC/XYZ.
+Итоговый SELECT — Фильтрует результаты по заданным параметрам ABC/XYZ и сортирует по изменению стоимости между периодами (по убыванию).
+
+Код сравнивает продажи Ozon по SKU за два периода, анализирует динамику и стабильность спроса с помощью ABC-XYZ анализа.
+
+*/
+
+WITH period_1 as (
+SELECT   
+    p.sku as sku1   
+    , MIN(articul) as articul
+    , COUNT(order_id) as sale_count1
+    , SUM(saller_price * quanty) as sale_price1
+    , 100 * SUM(saller_price * quanty) / SUM(SUM(saller_price * quanty)) OVER () as sale_per    
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku    
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN {{date1_from}}::date AND {{date1_to}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END        
+GROUP BY
+    1
+), 
+
+period_1_m1 as (
+SELECT   
+    p.sku as sku1
+    , COUNT(order_id) as sale_count1_m1
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku      
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN ({{date1_from}} - ({{date1_to}}::date - {{date1_from}}::date) * INTERVAL '1 days')::date AND {{date1_from}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%') OR p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))     
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END     
+GROUP BY
+    1
+), 
+
+period_1_m2 as (
+SELECT   
+    p.sku as sku1
+    , COUNT(order_id) as sale_count1_m2
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku    
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN ({{date1_from}}::date - 2 * ({{date1_to}}::date - {{date1_from}}::date) * INTERVAL '1 days')::date AND ({{date1_from}}::date - ({{date1_to}}::date - {{date1_from}}::date) * INTERVAL '1 days')::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%') OR p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%')) 
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END             
+GROUP BY
+    1
+), 
+
+xyz_pre1 as (
+    SELECT 
+        p1.sku1
+        , p1.sale_count1 
+        , COALESCE(sale_count1_m1, 0) as sale_count1_m1
+        , COALESCE(sale_count1_m2, 0) as sale_count1_m2
+        , (COALESCE(sale_count1, 0) + COALESCE(sale_count1_m1, 0) + COALESCE(sale_count1_m2, 0)) / 3 as avg_sale1        
+    FROM
+        period_1 as p1
+    LEFT JOIN
+        period_1_m1 as p1_m1
+    ON p1.sku1 = p1_m1.sku1        
+    LEFT JOIN
+        period_1_m2 as p1_m2
+    ON p1.sku1 = p1_m2.sku1     
+),
+
+xyz1 as (
+    SELECT
+        *
+        , SQRT(
+            ((COALESCE(sale_count1, 0) - avg_sale1)^2 
+            + (COALESCE(sale_count1_m1, 0) - avg_sale1)^2 
+            + (COALESCE(sale_count1_m2, 0) - avg_sale1)^2) / 3
+        )::NUMERIC(10, 2) AS stddev_sale1
+    FROM
+       xyz_pre1
+),
+
+abc_per1 as (
+    SELECT 
+        p1.sku1 
+        , articul
+        , p1.sale_count1
+        , sale_price1
+        , sale_per as sale_per1
+        , SUM(sale_per) OVER (ORDER BY sale_per DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::NUMERIC(10,2) as cum_sale_per1
+        , avg_sale1
+        , stddev_sale1            
+    FROM
+        period_1 as p1
+    LEFT JOIN
+       xyz1 ON  p1.sku1 = xyz1.sku1            
+),
+
+period_2 AS (
+SELECT   
+    p.sku as sku2
+    , COUNT(order_id) as sale_count2
+    , SUM(saller_price * quanty) as sale_price2
+    , 100 * SUM(saller_price * quanty) / SUM(SUM(saller_price * quanty)) OVER () as sale_per
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku        
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN {{date2_from}}::date AND {{date2_to}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))   
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END           
+GROUP BY
+    1
+),
+
+period_2_m1 as (
+SELECT   
+    p.sku as sku2
+    , COUNT(order_id) as sale_count2_m1
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku        
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN ({{date2_from}} - ({{date2_to}}::date - {{date2_from}}::date) * INTERVAL '1 days')::date AND {{date2_from}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%') OR p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))  
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END            
+GROUP BY
+    1
+), 
+
+period_2_m2 as (
+SELECT   
+    p.sku as sku2
+    , COUNT(order_id) as sale_count2_m2
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku        
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN ({{date2_from}}::date - 2 * ({{date2_to}}::date - {{date2_from}}::date) * INTERVAL '1 days')::date AND ({{date2_from}}::date - ({{date2_to}}::date - {{date2_from}}::date) * INTERVAL '1 days')::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%') OR p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))     
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END         
+GROUP BY
+    1
+), 
+
+xyz_pre2 as (
+    SELECT 
+        p2.sku2
+        , p2.sale_count2 
+        , COALESCE(sale_count2_m1, 0) as sale_count2_m1
+        , COALESCE(sale_count2_m2, 0) as sale_count2_m2
+        , (COALESCE(sale_count2, 0) + COALESCE(sale_count2_m1, 0) + COALESCE(sale_count2_m2, 0)) / 3 as avg_sale2             
+    FROM
+        period_2 as p2
+    LEFT JOIN
+        period_2_m1 as p2_m1
+    ON p2.sku2 = p2_m1.sku2        
+    LEFT JOIN
+        period_2_m2 as p2_m2
+    ON p2.sku2 = p2_m2.sku2     
+),
+
+xyz2 as (
+    SELECT
+        *
+        , SQRT(
+            ((COALESCE(sale_count2, 0) - avg_sale2)^2 
+            + (COALESCE(sale_count2_m1, 0) - avg_sale2)^2 
+            + (COALESCE(sale_count2_m2, 0) - avg_sale2)^2) / 3
+        )::NUMERIC(10, 2) AS stddev_sale2
+    FROM
+       xyz_pre2
+),
+
+abc_per2 as (
+    SELECT 
+        p2.sku2
+        , p2.sale_count2
+        , sale_price2
+        , sale_per as sale_per2
+        , SUM(sale_per) OVER (ORDER BY sale_per DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::NUMERIC(10,2) as cum_sale_per2
+        , avg_sale2
+        , stddev_sale2             
+    FROM
+        period_2 as p2
+    LEFT JOIN
+       xyz2 ON  p2.sku2 = xyz2.sku2      
+), 
+
+on_stock as (
+SELECT
+    sku
+    , SUM(available_stock_count) as onstock
+FROM
+    oz_fbo_stocks            
+GROUP BY
+    1                
+), 
+
+pre_table as (
+SELECT
+    COALESCE(sku1, sku2) as sku
+    , p.articul  as "Артикул"
+    , create_date::date as "Дата создания карточки"   
+    , COALESCE(sale_count1, 0) as "Колво период1"
+    , COALESCE(sale_price1, 0) as "Стоимость период1"    
+    , COALESCE(sale_per1, 0) as "% продаж период1"
+    , COALESCE(cum_sale_per1, 0) as "% продаж нарастанием период1"
+    , COALESCE(sale_count2, 0) as "Колво период2"
+    , COALESCE(sale_price2, 0) as "Стоимость период2"    
+    , COALESCE(sale_per2, 0) as "% продаж период2"
+    , COALESCE(cum_sale_per2, 0) as "% продаж нарастанием период2"
+    , CASE WHEN abc_per1.cum_sale_per1 < 50 THEN 'A+'
+           WHEN abc_per1.cum_sale_per1 < 80 THEN 'A'
+           WHEN abc_per1.cum_sale_per1 < 95 THEN 'B'           
+           WHEN abc_per1.cum_sale_per1 <= 100 AND sale_count1 > 0 THEN 'C'           
+           ELSE 'D'
+           END  as "ABC стоимости1" 
+    , CASE WHEN abc_per2.cum_sale_per2 < 50 THEN 'A+'
+           WHEN abc_per2.cum_sale_per2 < 80 THEN 'A'
+           WHEN abc_per2.cum_sale_per2 < 95 THEN 'B'
+           WHEN abc_per2.cum_sale_per2 <= 100 AND sale_count2 > 0 THEN 'C'                             
+           ELSE 'D'
+           END  as "ABC стоимости2"
+    , CASE WHEN stddev_sale1 / NULLIF(avg_sale1, 0) < 0.5 THEN 'X'
+           WHEN stddev_sale1 / NULLIF(avg_sale1, 0) < 1 THEN 'Y'
+           ELSE 'Z'
+           END as "XYZ колво1"
+    , CASE WHEN stddev_sale2 / NULLIF(avg_sale2, 0) < 0.5 THEN 'X'
+           WHEN stddev_sale2 / NULLIF(avg_sale2, 0) < 1 THEN 'Y'
+           ELSE 'Z'
+           END as "XYZ колво2"       
+    , '  ' as " - " 
+    , COALESCE(sale_count2, 0) - COALESCE(sale_count1, 0) as "Колво (Пер2 - Пер1)"                       
+    , COALESCE(sale_price2, 0) - COALESCE(sale_price1, 0) as "Стоимость (Пер2 - Пер1)"
+    , COALESCE(onstock, 0) as "На скаладх OZ"                    
+FROM
+    abc_per1
+FULL JOIN
+    abc_per2
+ON      
+    abc_per1.sku1 = abc_per2.sku2
+LEFT JOIN
+    oz_products as p ON abc_per1.sku1 = p.sku 
+    OR abc_per2.sku2 = p.sku
+LEFT JOIN
+    on_stock as st ON abc_per1.sku1 = st.sku 
+    OR abc_per2.sku2 = st.sku       
+)
+
+SELECT
+    *
+FROM
+    pre_table
+WHERE    
+    CASE WHEN '_' IN {{abc1}} THEN TRUE
+            ELSE "ABC стоимости1" IN {{abc1}} END
+    AND CASE WHEN '_' IN {{abc2}} THEN TRUE
+            ELSE "ABC стоимости2" IN {{abc2}} END  
+    AND CASE WHEN '_' IN {{xyz1}} THEN TRUE
+            ELSE "XYZ колво1" IN {{xyz1}} END
+    AND CASE WHEN '_' IN {{xyz2}} THEN TRUE
+            ELSE "XYZ колво2" IN {{xyz2}} END              
+ORDER BY
+    "Стоимость (Пер2 - Пер1)"  DESC           
+
+
+
+------------------------------------------
+
+
+
+/*
+Запрос формирует таблицу заказов, выкупов и возратов за выбранный период с возможностью группировки по артикулу, модели продаж, магазину.
+
+Входные параметры:
+- {{date_from}} и {{date_to}} — фильт периода
+- {{grb}} - группировка по магазину/модели/артикулу
+- {{shop}}, {{fbos}}, {{par_char_articul_like}} — фильтры по магазину, модели FBO/FBS, артикулу.
+Логика:
+- Ищем по таблице отправлений все заказы, по таблице отправлений усешно доставленные заказы, по таблице возвратов возвраты в заданном диапазоне дат
+- Группируем днм/неделям/месяцам
+- Объединем таблицы "слева".
+- Вычисляем проценты от колва и стомости заказов
+- Формируем итоговую таблицу
+
+-------------------
+orders_t — Агрегирует данные по заказам Ozon (количество, стоимость) с группировкой по выбранному параметру (магазин, FBS/FBO или SKU).
+sales_t — Агрегирует данные по доставленным заказам (продажам) с аналогичной группировкой.
+tr_orders — Объединяет данные заказов и транзакций для расчета комиссий Ozon.
+sales_tr — Рассчитывает итоговые выплаты (forpay) по доставленным заказам с группировкой.
+returns_t — Агрегирует данные по возвратам с группировкой.
+t1 — Объединяет данные из заказов, продаж, транзакций и возвратов в общую таблицу.
+t2 — Добавляет расчет долей в общем количестве заказов и стоимости.
+final_table — Формирует финальную таблицу с ключевыми метриками (заказы, продажи, возвраты, комиссии).
+Итоговый SELECT — Добавляет строку с итогами и сортирует результат по количеству товаров в заказах (по убыванию).
+
+*/
+
+
+WITH orders_t as (
+SELECT
+    CASE WHEN {{grb}} = 'shop' THEN shop
+        WHEN {{grb}} = 'fbos' THEN fbos
+        ELSE p.sku::varchar
+        END  as o_grb
+    , CASE WHEN {{grb}} = 'sku' THEN MIN(articul)
+        ELSE COUNT(DISTINCT p.sku)::varchar
+        END as o_articul     
+    , COUNT(order_id) as orders_count
+    , SUM(quanty) as product_count
+    , SUM(saller_price  * quanty) as orders_price
+    , SUM(buyer_price  * quanty * rubcur)::NUMERIC(10, 2) as byers_price      
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku      
+WHERE
+    start_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+    AND status != 'Отменён'
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))  
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END    
+GROUP BY
+    1
+), 
+sales_t as (
+SELECT
+    CASE WHEN {{grb}} = 'shop' THEN shop
+        WHEN {{grb}} = 'fbos' THEN fbos
+        ELSE p.sku::varchar
+        END  as s_grb
+    , CASE WHEN {{grb}} = 'sku' THEN MIN(articul)
+        ELSE COUNT(DISTINCT p.sku)::varchar
+        END as s_articul           
+    , COUNT(order_id) as sales_count
+    , SUM(quanty) as sales_ed_count 
+    , SUM(saller_price * quanty) as sales_price
+    , SUM(buyer_price  * quanty * rubcur) as buyer_sales_price        
+FROM
+    oz_postings as p
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku      
+WHERE
+    status = 'Доставлен'
+    AND delivery_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+    AND CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE fbos IN {{fbos}} END
+    AND (articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))   
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END          
+GROUP BY
+    1
+), 
+
+tr_orders as (SELECT
+    p.order_id
+    , p.shop
+    , p.fbos
+    , p.sku
+    , p.articul
+    , t.operation_type_name
+    , t.quantity as t_quantity
+    , accruals_for_sale
+    , sale_commission
+FROM
+    oz_postings as p
+JOIN
+    oz_transactions as t
+ON
+    p.order_id = t.order_id
+    AND t.skus::varchar LIKE '%'||p.sku::varchar||'%'
+    AND  status = 'Доставлен'
+    AND delivery_date != 'nan'
+    AND delivery_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    p.sku = c.sku 
+WHERE        
+    CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE p.shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE p.fbos IN {{fbos}} END
+    AND (p.articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  p.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%'))    
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END          
+), 
+sales_tr as (
+SELECT
+    CASE WHEN {{grb}} = 'shop' THEN shop
+        WHEN {{grb}} = 'fbos' THEN fbos
+        ELSE sku::varchar
+        END  as st_grb
+    , COALESCE (sum((accruals_for_sale + sale_commission) / t_quantity) FILTER (WHERE operation_type_name = 'Доставка покупателю')::NUMERIC(10, 2), 0) as forpay
+FROM
+    tr_orders
+GROUP BY
+    1
+),
+
+returns_t as (
+SELECT
+    CASE WHEN {{grb}} = 'shop' THEN r.shop
+        WHEN {{grb}} = 'fbos' THEN r.fbos
+        ELSE r.sku::varchar
+        END  as r_grb
+    , CASE WHEN {{grb}} = 'sku' THEN MIN(r.articul)
+        ELSE COUNT(DISTINCT r.sku)::varchar
+        END as r_articul           
+    , SUM(r.quantity) as return_count
+    , SUM(r.price * r.quantity) as return_price  
+FROM
+    oz_returns as r
+JOIN 
+    oz_postings as p
+ON
+    r.order_id = p.order_id
+    AND r.sku = p.sku
+    AND p.status = 'Доставлен'    
+    AND return_date::date BETWEEN {{date_from}}::date AND {{date_to}}::date
+LEFT JOIN
+    oz_prod_cats as c
+ON
+    r.sku = c.sku 
+WHERE    
+    CASE WHEN '_' IN {{shop}} THEN TRUE
+            ELSE r.shop IN {{shop}} END
+    AND CASE WHEN '_' IN {{fbos}} THEN TRUE
+            ELSE r.fbos IN {{fbos}} END
+    AND (r.articul ILIKE CONCAT('%',{{par_char_articul_like}}, '%')  OR  r.sku::varchar ILIKE CONCAT('%',{{par_char_articul_like}}, '%')) 
+    AND CASE WHEN '_' IN {{cat_name}} THEN TRUE
+            ELSE cat_name IN {{cat_name}} END         
+GROUP BY
+    1
+),
+t1 as (
+SELECT
+    COALESCE(o.o_grb, s.s_grb, r.r_grb, st.st_grb)   as grb
+    , COALESCE(o.o_articul, s.s_articul, r.r_articul) as articul
+    , COALESCE(orders_count, 0) as orders_count
+    , COALESCE(product_count, 0) as product_count
+    , COALESCE(orders_price, 0) as orders_price
+    , COALESCE(byers_price, 0) as byers_price
+    , COALESCE(sales_count, 0) as sales_count
+    , COALESCE(sales_ed_count, 0) as sales_ed_count    
+    , COALESCE(sales_price, 0) as sales_price
+    , COALESCE(buyer_sales_price, 0) as buyer_sales_price
+    , COALESCE(return_count, 0) as return_count
+    , COALESCE(return_price, 0) as return_price   
+    , COALESCE(forpay, 0) as forpay   
+FROM
+    orders_t as o
+FULL JOIN    
+    sales_t as s ON o.o_grb = s.s_grb
+FULL JOIN    
+    sales_tr as st ON s.s_grb = st.st_grb    
+FULL JOIN
+    returns_t as r ON o.o_grb = r.r_grb
+), 
+t2 as (
+SELECT
+    *
+    , (100 * orders_price / NULLIF(SUM(orders_price) OVER(), 0)) as per_price   
+    , (100 * orders_count / NULLIF(SUM(orders_count) OVER(), 0)) as per_orders
+FROM
+    t1    
+),
+final_table as (
+SELECT 
+    grb
+    , articul as "Артикул"
+    , orders_count as "Колво заказы"
+    , product_count as "Колво товаров"
+    , per_orders as "% заказов"
+    , byers_price as "Стоимость покупателя"    
+    , orders_price as "Стоимость продавца"
+    , per_price as "% стоимости"
+    , COALESCE(orders_price / NULLIF(product_count, 0), 0) as "Средняя цена"
+    , sales_count as "Колво выкупов (доставок)" 
+    , sales_ed_count as "Товаров выкуплено"     
+    , sales_price as "Стоимость выкупов"
+    , buyer_sales_price as "Стоимость выкупов покупателя"    
+    , forpay  as "Стоимость выкупов - комм OZ"
+    , return_count as "Колво возвратов" 
+    , return_price as "Стоимость возвратов" 
+FROM
+    t2
+)    
+
+
+SELECT
+    *
+FROM
+    final_table  
+    
+UNION       
+SELECT
+    '- Итого -'
+    , '0'
+    , SUM("Колво заказы")
+    , SUM("Колво товаров")
+    , NULL
+    , SUM("Стоимость покупателя")    
+    , SUM("Стоимость продавца")
+    , NULL
+    , SUM("Стоимость продавца") / SUM("Колво товаров")
+    , SUM("Колво выкупов (доставок)") 
+    , SUM("Товаров выкуплено")    
+    , SUM("Стоимость выкупов")    
+    , SUM("Стоимость выкупов покупателя")         
+    , SUM("Стоимость выкупов - комм OZ")    
+    , SUM("Колво возвратов")    
+    , SUM("Стоимость возвратов")                    
+FROM
+    final_table
+ORDER BY
+    4 DESC
+	
+	
